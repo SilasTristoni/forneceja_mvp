@@ -24,11 +24,10 @@ const pool = mysql.createPool({
 
 const SCORE_FORMULA = [
   '30% pontualidade de entrega',
-  '25% qualidade do produto',
-  '15% atendimento',
-  '10% preço',
-  '10% consistência de atrasos',
-  '10% volume e recência das avaliações'
+  '30% qualidade do produto',
+  '20% preço',
+  '20% atendimento',
+  'Atrasos recorrentes penalizam o score'
 ];
 
 const PLANS = [
@@ -472,7 +471,7 @@ function scoreFromEvaluations(evaluations = []) {
       warnings: ['Sem avaliações suficientes'],
       recommendation: 'Fornecedor ainda não possui histórico suficiente para recomendação automática.',
       formula: SCORE_FORMULA,
-      components: { onTime: 0, quality: 0, service: 0, price: 0, consistency: 0, confidence: 0 },
+      components: { onTime: 0, quality: 0, service: 0, price: 0 },
       lateRate: 0,
       totalDeliveries: 0,
       lateDeliveries: 0,
@@ -487,22 +486,14 @@ function scoreFromEvaluations(evaluations = []) {
   const totalDeliveries = evaluations.reduce((sum, item) => sum + toNumber(item.total_deliveries), 0);
   const lateDeliveries = evaluations.reduce((sum, item) => sum + toNumber(item.late_deliveries), 0);
   const lateRate = totalDeliveries > 0 ? lateDeliveries / totalDeliveries : 0;
-  const consistency = totalDeliveries > 0 ? Math.max(0, 100 - lateRate * 100) : 45;
-  const volume = Math.min(100, totalDeliveries * 3);
-  const recent = Math.round(
-    evaluations.reduce((sum, item) => sum + recencyWeight(item.created_at) * 100, 0) / evaluations.length
-  );
-  const confidence = Math.round(volume * 0.65 + recent * 0.35);
-
   const rawScore =
     onTime * 0.3 +
-    quality * 0.25 +
-    service * 0.15 +
-    price * 0.1 +
-    consistency * 0.1 +
-    confidence * 0.1;
+    quality * 0.3 +
+    price * 0.2 +
+    service * 0.2;
+  const delayPenalty = lateRate >= 0.3 ? 18 : lateRate >= 0.2 ? 12 : lateRate >= 0.1 ? 6 : 0;
   const sampleRisk = totalDeliveries < 10 ? 8 : totalDeliveries < 20 ? 3 : 0;
-  const score = Math.max(0, Math.min(100, Math.round(rawScore - sampleRisk)));
+  const score = Math.max(0, Math.min(100, Math.round(rawScore - delayPenalty - sampleRisk)));
 
   const warnings = [];
   if (lateRate >= 0.25) warnings.push('histórico relevante de atrasos');
@@ -511,8 +502,8 @@ function scoreFromEvaluations(evaluations = []) {
   if (quality < 75) warnings.push('qualidade abaixo da média');
   if (totalDeliveries < 10) warnings.push('amostra de avaliações pequena');
 
-  const level = score >= 80 ? 'confiavel' : score >= 60 ? 'atencao' : 'alto_risco';
-  const label = score >= 80 ? 'Confiável' : score >= 60 ? 'Atenção' : 'Alto risco';
+  const level = score >= 80 ? 'confiavel' : score >= 50 ? 'atencao' : 'alto_risco';
+  const label = score >= 80 ? 'Confiável' : score >= 50 ? 'Atenção' : 'Alto risco';
   const recommendation =
     score >= 80
       ? 'Fornecedor recomendado: histórico forte, recente e consistente.'
@@ -531,14 +522,12 @@ function scoreFromEvaluations(evaluations = []) {
       onTime: Math.round(onTime),
       quality: Math.round(quality),
       service: Math.round(service),
-      price: Math.round(price),
-      consistency: Math.round(consistency),
-      confidence
+      price: Math.round(price)
     },
     lateRate: Number(lateRate.toFixed(2)),
     totalDeliveries,
     lateDeliveries,
-    confidence
+    confidence: Math.max(0, Math.round(100 - delayPenalty - sampleRisk))
   };
 }
 
@@ -602,8 +591,8 @@ function enrichSupplier(supplier, evaluations = [], filters = {}, orders = []) {
     responseRate,
     score,
     sponsorNotice: toBool(supplier.is_sponsored)
-      ? 'Patrocinado: destaque pago aumenta visibilidade, mas nunca altera score, ranking de confiança ou recomendação.'
-      : 'Resultado orgânico: sem destaque pago.',
+      ? 'Destaque patrocinado: visibilidade comercial, nunca score maior. O foco é taxa por pedido gerado.'
+      : 'Resultado orgânico: mercado busca grátis e fornecedor paga apenas quando recebe oportunidade real.',
     trustSummary: `${score.totalDeliveries} entregas avaliadas, ${score.lateDeliveries} atraso(s), ${responseRate}% de resposta.`
   };
 
@@ -708,6 +697,8 @@ function withOrderRelations(order, suppliers, users = []) {
     response_price: order.response_price == null ? null : toNumber(order.response_price),
     response_delivery_days: order.response_delivery_days == null ? null : toNumber(order.response_delivery_days),
     supplier_name: supplier?.name || 'Fornecedor não encontrado',
+    supplier_phone: supplier?.phone || null,
+    supplier_contact_name: supplier?.contact_name || null,
     supplier_plan: supplier?.plan || 'gratuito',
     supplier_is_sponsored: toBool(supplier?.is_sponsored),
     supplier_is_verified: toBool(supplier?.is_verified),
@@ -838,7 +829,7 @@ app.get('/api/suppliers', async (req, res) => {
       sponsored: suppliers.filter((supplier) => supplier.is_sponsored).length,
       verified: suppliers.filter((supplier) => supplier.is_verified).length,
       reliable: suppliers.filter((supplier) => supplier.score.score >= 80).length,
-      highRisk: suppliers.filter((supplier) => supplier.score.score > 0 && supplier.score.score < 60).length
+      highRisk: suppliers.filter((supplier) => supplier.score.score > 0 && supplier.score.score < 50).length
     },
     suppliers
   });
@@ -1161,8 +1152,8 @@ app.get('/api/dashboard', async (req, res) => {
     totalSuppliers: enriched.length,
     totalOrders: ordersWithSupplier.length,
     reliableSuppliers: enriched.filter((supplier) => supplier.score.score >= 80).length,
-    attentionSuppliers: enriched.filter((supplier) => supplier.score.score >= 60 && supplier.score.score < 80).length,
-    highRiskSuppliers: enriched.filter((supplier) => supplier.score.score > 0 && supplier.score.score < 60).length,
+    attentionSuppliers: enriched.filter((supplier) => supplier.score.score >= 50 && supplier.score.score < 80).length,
+    highRiskSuppliers: enriched.filter((supplier) => supplier.score.score > 0 && supplier.score.score < 50).length,
     sponsoredSuppliers: enriched.filter((supplier) => supplier.is_sponsored).length,
     verifiedSuppliers: enriched.filter((supplier) => supplier.is_verified).length,
     averageScore,
